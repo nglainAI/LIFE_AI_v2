@@ -6,6 +6,10 @@
       "env": {
         "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN}"
       }
+    },
+    "window-control": {
+      "command": "python3",
+      "args": ["core/window_mcp_server.py"]
     }
   }
 }
