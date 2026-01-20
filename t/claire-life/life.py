@@ -180,16 +180,28 @@ class ReminderManager:
 
     def get_due(self) -> List[Dict]:
         """Получить напоминания, время которых пришло"""
+        # ВАЖНО: перечитываем файл — MCP мог добавить новые напоминания!
+        self.reminders = self.load()
+
         now = datetime.now()
         due = []
         for r in self.reminders:
             if r["status"] == "pending":
                 try:
-                    remind_time = datetime.fromisoformat(r["remind_at"])
+                    remind_at_str = r["remind_at"]
+                    # Обработка UTC формата (Z на конце) из JavaScript
+                    if remind_at_str.endswith('Z'):
+                        # Конвертируем UTC в локальное время
+                        from datetime import timezone
+                        remind_time = datetime.fromisoformat(remind_at_str.replace('Z', '+00:00'))
+                        remind_time = remind_time.replace(tzinfo=None) + (datetime.now() - datetime.utcnow())
+                    else:
+                        remind_time = datetime.fromisoformat(remind_at_str)
+
                     if remind_time <= now:
                         due.append(r)
-                except:
-                    pass  # Пропускаем битые записи
+                except Exception as e:
+                    print(f"[WARN] Ошибка парсинга напоминания {r.get('id')}: {e}")
         return due
 
     def mark_sent(self, reminder_id: str):
@@ -584,6 +596,8 @@ class ClaireLife:
                 # 0. НАПОМИНАНИЯ — ПЕРВЫМ ДЕЛОМ! (надёжность!)
                 # ═══════════════════════════════════════════════════════════
                 due_reminders = self.reminders.get_due()
+                if due_reminders:
+                    print(f"[DEBUG] Found {len(due_reminders)} due reminders!", flush=True)
                 for reminder in due_reminders:
                     Display.separator()
                     Display.status("remind", f"⏰ Напоминание для {reminder['chat_id']}")
