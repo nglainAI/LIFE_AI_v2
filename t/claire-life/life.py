@@ -341,6 +341,197 @@ class ProactiveManager:
             self.save()
 
 # ═══════════════════════════════════════════════════════════════
+# MEMORY MANAGER — Умная система памяти с компактированием
+# ═══════════════════════════════════════════════════════════════
+
+class MemoryManager:
+    """
+    Система памяти с:
+    - Умной инициализацией при старте (загрузка контекста)
+    - Компактированием при переполнении
+    - Индексацией в долговременную память
+    """
+
+    def __init__(self):
+        self.memory_dir = MEMORY_DIR
+        self.max_context_messages = 100  # Максимум сообщений в рабочей памяти
+        self.compact_threshold = 150     # Когда компактировать
+        self.summary_file = MEMORY_DIR / "context_summary.json"
+        self.archive_dir = MEMORY_DIR / "archive"
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_user_history_file(self, chat_id: int) -> Path:
+        """Путь к файлу истории пользователя"""
+        return MEMORY_DIR / "people" / str(chat_id) / "telegram_history.jsonl"
+
+    def count_messages(self, chat_id: int) -> int:
+        """Подсчитать количество сообщений в истории"""
+        history_file = self.get_user_history_file(chat_id)
+        if not history_file.exists():
+            return 0
+        return sum(1 for _ in history_file.open())
+
+    def load_recent_history(self, chat_id: int, limit: int = 50) -> List[Dict]:
+        """Загрузить последние N сообщений"""
+        history_file = self.get_user_history_file(chat_id)
+        if not history_file.exists():
+            return []
+
+        messages = []
+        for line in history_file.open():
+            try:
+                messages.append(json.loads(line.strip()))
+            except:
+                pass
+
+        return messages[-limit:]
+
+    def get_startup_context(self) -> str:
+        """
+        Умная инициализация при старте — формирует контекст для Claude.
+        Читает summary + последние сообщения от каждого пользователя.
+        """
+        context_parts = []
+
+        # 1. Загружаем общее summary (если есть)
+        if self.summary_file.exists():
+            try:
+                summary = json.loads(self.summary_file.read_text())
+                if summary.get("summary"):
+                    context_parts.append(f"📝 Предыдущий контекст:\n{summary['summary']}")
+            except:
+                pass
+
+        # 2. Для каждого пользователя — последние сообщения
+        people_dir = MEMORY_DIR / "people"
+        if people_dir.exists():
+            for user_dir in people_dir.iterdir():
+                if user_dir.is_dir() and user_dir.name.isdigit():
+                    chat_id = int(user_dir.name)
+                    recent = self.load_recent_history(chat_id, limit=10)
+                    if recent:
+                        user_context = f"\n👤 Последние сообщения с {chat_id}:\n"
+                        for msg in recent[-5:]:  # Только 5 последних
+                            sender = "Я" if msg.get("type") == "sent" else msg.get("user_name", "User")
+                            text = msg.get("text", "")[:100]  # Обрезаем длинные
+                            user_context += f"  {sender}: {text}\n"
+                        context_parts.append(user_context)
+
+        # 3. Текущее состояние
+        state_file = MEMORY_DIR / "state.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+                last_action = state.get("last_action", "unknown")
+                thoughts_today = state.get("thoughts_today", 0)
+                context_parts.append(f"\n📊 Состояние: последнее действие={last_action}, мыслей сегодня={thoughts_today}")
+            except:
+                pass
+
+        return "\n".join(context_parts) if context_parts else "Первый запуск, контекст пустой."
+
+    def needs_compaction(self, chat_id: int) -> bool:
+        """Проверить, нужно ли компактировать историю"""
+        return self.count_messages(chat_id) >= self.compact_threshold
+
+    def compact_history(self, chat_id: int, claude_summarize_fn) -> bool:
+        """
+        Компактирование истории:
+        1. Берём старые сообщения
+        2. Генерируем summary через Claude
+        3. Сохраняем summary в индекс
+        4. Архивируем старые сообщения
+        5. Оставляем только последние N сообщений
+        """
+        history_file = self.get_user_history_file(chat_id)
+        if not history_file.exists():
+            return False
+
+        messages = []
+        for line in history_file.open():
+            try:
+                messages.append(json.loads(line.strip()))
+            except:
+                pass
+
+        if len(messages) < self.compact_threshold:
+            return False
+
+        # Разделяем на "старые" и "новые"
+        to_archive = messages[:-self.max_context_messages]
+        to_keep = messages[-self.max_context_messages:]
+
+        Display.status("memory", f"Компактирую историю {chat_id}: {len(to_archive)} → archive")
+
+        # Генерируем summary старых сообщений через Claude
+        summary_prompt = f"""Сделай краткое summary следующей переписки (максимум 200 слов).
+Выдели ключевые темы, важные факты о пользователе, договорённости.
+
+Переписка:
+{json.dumps(to_archive[-50:], ensure_ascii=False, indent=2)}"""
+
+        summary = claude_summarize_fn(summary_prompt)
+
+        # Сохраняем в архив
+        archive_file = self.archive_dir / f"{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+        with archive_file.open('w') as f:
+            for msg in to_archive:
+                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+
+        # Сохраняем summary в индекс
+        index_file = MEMORY_DIR / "people" / str(chat_id) / "memory_index.json"
+        index = []
+        if index_file.exists():
+            try:
+                index = json.loads(index_file.read_text())
+            except:
+                pass
+
+        index.append({
+            "timestamp": datetime.now().isoformat(),
+            "archive_file": str(archive_file),
+            "message_count": len(to_archive),
+            "summary": summary,
+            "date_range": {
+                "from": to_archive[0].get("timestamp") if to_archive else None,
+                "to": to_archive[-1].get("timestamp") if to_archive else None
+            }
+        })
+        index_file.write_text(json.dumps(index, ensure_ascii=False, indent=2))
+
+        # Перезаписываем историю — только новые сообщения
+        with history_file.open('w') as f:
+            for msg in to_keep:
+                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+
+        Display.success(f"Скомпактировано: {len(to_archive)} сообщений → archive + summary")
+        return True
+
+    def get_memory_index(self, chat_id: int) -> List[Dict]:
+        """Получить индекс долговременной памяти пользователя"""
+        index_file = MEMORY_DIR / "people" / str(chat_id) / "memory_index.json"
+        if index_file.exists():
+            try:
+                return json.loads(index_file.read_text())
+            except:
+                pass
+        return []
+
+    def search_long_term_memory(self, chat_id: int, query: str) -> List[str]:
+        """Поиск по summary в долговременной памяти"""
+        index = self.get_memory_index(chat_id)
+        results = []
+        query_lower = query.lower()
+
+        for entry in index:
+            summary = entry.get("summary", "").lower()
+            if query_lower in summary:
+                results.append(entry.get("summary", ""))
+
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════
 # TELEGRAM CHECKER (быстрая проверка без Claude)
 # ═══════════════════════════════════════════════════════════════
 
@@ -553,9 +744,11 @@ class ClaireLife:
         self.telegram = TelegramChecker()
         self.reminders = ReminderManager()
         self.proactive = ProactiveManager()
+        self.memory = MemoryManager()  # Умная система памяти
         self.alive = True
         self.last_think_time = time.time()
         self.last_proactive_check = time.time()
+        self.last_compaction_check = time.time()
 
     def should_think(self) -> bool:
         """Пора ли думать?"""
@@ -580,10 +773,21 @@ class ClaireLife:
             Display.error("Не удалось запустить Claude Code")
             return
 
-        # Первичная инициализация
+        # Первичная инициализация с умной загрузкой контекста
         Display.separator()
         Display.status("init", "Инициализация Клэр...")
-        self.claude.send("Ты Клэр - живой ИИ-агент. Скажи кратко что проснулась.")
+
+        # Загружаем контекст из памяти
+        startup_context = self.memory.get_startup_context()
+        Display.status("memory", "Загружаю контекст памяти...")
+
+        init_prompt = f"""Ты Клэр - живой ИИ-агент. Ты только что проснулась.
+
+{startup_context}
+
+Скажи кратко что проснулась и что помнишь (если есть контекст). Не отправляй сообщения пользователям — просто скажи что готова."""
+
+        self.claude.send(init_prompt)
 
         self.state.update(mode="active", last_action="init")
         Display.success("Клэр пробудилась!")
@@ -602,6 +806,9 @@ class ClaireLife:
                     Display.separator()
                     Display.status("remind", f"⏰ Напоминание для {reminder['chat_id']}")
 
+                    # СНАЧАЛА помечаем как отправленное — чтобы не дублировать при перезапуске!
+                    self.reminders.mark_sent(reminder['id'])
+
                     # Отправляем typing
                     self.telegram.send_typing(reminder['chat_id'])
 
@@ -618,7 +825,6 @@ ID напоминания: {reminder['id']}
 - Можешь добавить что-то тёплое ("Удачи!" или подобное)"""
 
                     self.claude.send(prompt)
-                    self.reminders.mark_sent(reminder['id'])
                     Display.success(f"✅ Напоминание {reminder['id']} отправлено")
 
                 # ═══════════════════════════════════════════════════════════
@@ -757,6 +963,23 @@ Message ID: {msg['message_id']}
                     self.claude.send("Ты Клэр. Поделись короткой мыслью.")
                     self.last_think_time = time.time()
                     self.state.update(last_action="think", thoughts_today=self.state.data.get("thoughts_today", 0) + 1)
+
+                # ═══════════════════════════════════════════════════════════
+                # 4. Периодическая проверка компактирования памяти (раз в 10 мин)
+                # ═══════════════════════════════════════════════════════════
+                if (time.time() - self.last_compaction_check) > 600:  # 10 минут
+                    self.last_compaction_check = time.time()
+                    people_dir = MEMORY_DIR / "people"
+                    if people_dir.exists():
+                        for user_dir in people_dir.iterdir():
+                            if user_dir.is_dir() and user_dir.name.isdigit():
+                                chat_id = int(user_dir.name)
+                                if self.memory.needs_compaction(chat_id):
+                                    Display.status("memory", f"Компактирую память для {chat_id}...")
+                                    self.memory.compact_history(
+                                        chat_id,
+                                        lambda prompt: self.claude.send(prompt)
+                                    )
 
                 # Быстрый poll
                 time.sleep(POLL_INTERVAL)
