@@ -616,6 +616,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["chat_id", "message_id"]
         },
+      },
+      // ═══════════════════════════════════════════════════════════════
+      // НАПОМИНАНИЯ
+      // ═══════════════════════════════════════════════════════════════
+      {
+        name: "create_reminder",
+        description: "Создать напоминание для пользователя. Напоминание сработает в указанное время.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            chat_id: { type: "integer", description: "ID чата пользователя" },
+            text: { type: "string", description: "Текст напоминания (что напомнить)" },
+            remind_at: { type: "string", description: "Когда напомнить в формате ISO (2025-01-20T15:00:00) или относительно (+2h, +30m, +1d)" },
+            repeat: { type: "string", description: "Повторение: null (однократно), 'daily', 'weekly', 'monthly'", default: null }
+          },
+          required: ["chat_id", "text", "remind_at"]
+        },
+      },
+      {
+        name: "list_reminders",
+        description: "Показать все активные напоминания пользователя",
+        inputSchema: {
+          type: "object",
+          properties: {
+            chat_id: { type: "integer", description: "ID чата пользователя" }
+          },
+          required: ["chat_id"]
+        },
+      },
+      {
+        name: "delete_reminder",
+        description: "Удалить напоминание по ID",
+        inputSchema: {
+          type: "object",
+          properties: {
+            chat_id: { type: "integer", description: "ID чата пользователя (для проверки прав)" },
+            reminder_id: { type: "string", description: "ID напоминания для удаления" }
+          },
+          required: ["chat_id", "reminder_id"]
+        },
       }
     ],
   };
@@ -986,6 +1026,209 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{
           type: "text",
           text: `❌ Ошибка реакции: ${error.message}`
+        }]
+      };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // НАПОМИНАНИЯ
+  // ═══════════════════════════════════════════════════════════════
+
+  if (name === "create_reminder") {
+    const { chat_id, text, remind_at, repeat = null } = args;
+
+    try {
+      // Парсим время напоминания
+      let reminderTime;
+
+      if (remind_at.startsWith('+')) {
+        // Относительное время: +2h, +30m, +1d
+        const now = new Date();
+        const match = remind_at.match(/^\+(\d+)([mhdw])$/);
+        if (match) {
+          const [, amount, unit] = match;
+          const num = parseInt(amount);
+          switch (unit) {
+            case 'm': reminderTime = new Date(now.getTime() + num * 60 * 1000); break;
+            case 'h': reminderTime = new Date(now.getTime() + num * 60 * 60 * 1000); break;
+            case 'd': reminderTime = new Date(now.getTime() + num * 24 * 60 * 60 * 1000); break;
+            case 'w': reminderTime = new Date(now.getTime() + num * 7 * 24 * 60 * 60 * 1000); break;
+          }
+        } else {
+          return {
+            content: [{
+              type: "text",
+              text: `❌ Неверный формат времени: ${remind_at}. Используй: +30m, +2h, +1d, +1w`
+            }]
+          };
+        }
+      } else {
+        // Абсолютное время ISO
+        reminderTime = new Date(remind_at);
+      }
+
+      if (isNaN(reminderTime.getTime())) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Неверная дата: ${remind_at}`
+          }]
+        };
+      }
+
+      // Генерируем ID и сохраняем
+      const reminderId = Math.random().toString(36).substring(2, 10);
+      const reminder = {
+        id: reminderId,
+        chat_id: chat_id,
+        text: text,
+        remind_at: reminderTime.toISOString(),
+        created_at: new Date().toISOString(),
+        status: "pending",
+        repeat: repeat
+      };
+
+      // Читаем существующие напоминания
+      const remindersFile = path.join(MEMORY_DIR, 'reminders.json');
+      let reminders = [];
+      try {
+        const data = await fs.readFile(remindersFile, 'utf8');
+        reminders = JSON.parse(data);
+      } catch {
+        // Файл не существует — начинаем с пустого массива
+      }
+
+      reminders.push(reminder);
+      await fs.writeFile(remindersFile, JSON.stringify(reminders, null, 2));
+
+      // Форматируем время для пользователя
+      const timeStr = reminderTime.toLocaleString('ru-RU', {
+        day: 'numeric',
+        month: 'long',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: `⏰ Напоминание создано!\n\n📝 ${text}\n🕐 ${timeStr}\n🆔 ${reminderId}${repeat ? `\n🔄 Повтор: ${repeat}` : ''}`
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Ошибка создания напоминания: ${error.message}`
+        }]
+      };
+    }
+  }
+
+  if (name === "list_reminders") {
+    const { chat_id } = args;
+
+    try {
+      const remindersFile = path.join(MEMORY_DIR, 'reminders.json');
+      let reminders = [];
+
+      try {
+        const data = await fs.readFile(remindersFile, 'utf8');
+        reminders = JSON.parse(data);
+      } catch {
+        // Файл не существует
+      }
+
+      // Фильтруем по пользователю и статусу
+      const userReminders = reminders.filter(r =>
+        r.chat_id === chat_id && r.status === 'pending'
+      );
+
+      if (userReminders.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: "📭 У тебя пока нет активных напоминаний"
+          }]
+        };
+      }
+
+      // Форматируем список
+      const list = userReminders.map(r => {
+        const time = new Date(r.remind_at).toLocaleString('ru-RU', {
+          day: 'numeric',
+          month: 'short',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+        const repeatStr = r.repeat ? ` 🔄${r.repeat}` : '';
+        return `• [${r.id}] ${time}${repeatStr}\n  ${r.text}`;
+      }).join('\n\n');
+
+      return {
+        content: [{
+          type: "text",
+          text: `⏰ Твои напоминания (${userReminders.length}):\n\n${list}\n\nУдалить: /cancel ID`
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Ошибка: ${error.message}`
+        }]
+      };
+    }
+  }
+
+  if (name === "delete_reminder") {
+    const { chat_id, reminder_id } = args;
+
+    try {
+      const remindersFile = path.join(MEMORY_DIR, 'reminders.json');
+      let reminders = [];
+
+      try {
+        const data = await fs.readFile(remindersFile, 'utf8');
+        reminders = JSON.parse(data);
+      } catch {
+        return {
+          content: [{
+            type: "text",
+            text: "📭 Нет напоминаний для удаления"
+          }]
+        };
+      }
+
+      // Ищем напоминание (проверяем что оно принадлежит этому пользователю)
+      const index = reminders.findIndex(r =>
+        r.id === reminder_id && r.chat_id === chat_id
+      );
+
+      if (index === -1) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Напоминание ${reminder_id} не найдено`
+          }]
+        };
+      }
+
+      const deleted = reminders.splice(index, 1)[0];
+      await fs.writeFile(remindersFile, JSON.stringify(reminders, null, 2));
+
+      return {
+        content: [{
+          type: "text",
+          text: `🗑️ Напоминание удалено:\n${deleted.text}`
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Ошибка: ${error.message}`
         }]
       };
     }
