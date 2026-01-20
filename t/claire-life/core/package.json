@@ -1,0 +1,17 @@
+{
+  "name": "telegram-mcp",
+  "version": "1.0.0",
+  "description": "Telegram MCP Server",
+  "type": "module",
+  "bin": {
+    "telegram-mcp": "./telegram.js"
+  },
+  "scripts": {
+    "start": "node telegram.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "node-fetch": "^3.3.2",
+    "form-data": "^4.0.0"
+  }
+}

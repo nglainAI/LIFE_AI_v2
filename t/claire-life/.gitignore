@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+core/.env
+
+# Logs
+logs/
+*.log
+
+# Memory (личные данные)
+memory/
+Memory/
+
+# Claude settings
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
